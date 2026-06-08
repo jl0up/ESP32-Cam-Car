@@ -102,7 +102,7 @@ void setup() {
     config.xclk_freq_hz = 10000000;
     config.pixel_format = PIXFORMAT_JPEG;
     config.frame_size   = FRAMESIZE_OK;
-    config.jpeg_quality = 20;
+    config.jpeg_quality = 30;
     config.fb_count     = psramFound() ? 3 : 1;
 
     strcpy(diag.lastEvent, "Boot");
