@@ -360,11 +360,45 @@ static void tcp_server_task(void *) {
 //
 // On narrow screens the dpad moves below the canvas.
 
+
+// // ── Camera Resolution Query Handler ──────────────────────────────────────────
+// static esp_err_t camera_res_handler(httpd_req_t *req) {
+//     char json[64];
+//     sensor_t *s = esp_camera_sensor_get();
+    
+//     if (!s) {
+//         httpd_resp_set_type(req, "application/json");
+//         httpd_resp_sendstr(req, "{\"currentRes\":\"10\"}");
+//         return ESP_OK;
+//     }
+    
+//     // Get current frame size - the function returns the actual current size
+//     framesize_t current_size = s->get_framesize(s, FRAMESIZE_SVGA);
+    
+//     char size_str[16];
+    
+//     switch(current_size) {
+//         case FRAMESIZE_QVGA:   strcpy(size_str, "7"); break;
+//         case FRAMESIZE_HVGA:   strcpy(size_str, "8"); break;
+//         case FRAMESIZE_VGA:    strcpy(size_str, "9"); break;
+//         case FRAMESIZE_SVGA:   strcpy(size_str, "10"); break;
+//         case FRAMESIZE_XGA:    strcpy(size_str, "11"); break;
+//         case FRAMESIZE_HD:     strcpy(size_str, "12"); break;
+//         case FRAMESIZE_SXGA:   strcpy(size_str, "13"); break;
+//         case FRAMESIZE_UXGA:   strcpy(size_str, "14"); break;
+//         default:               strcpy(size_str, "10"); break;
+//     }
+    
+//     snprintf(json, sizeof(json), "{\"currentRes\":\"%s\"}", size_str);
+    
+//     httpd_resp_set_type(req, "application/json");
+//     return httpd_resp_sendstr(req, json);
+// }
+
+
 static esp_err_t index_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html");
 
-    // The page is assembled as a raw string. Keeping it readable here matters
-    // more than saving a few bytes — the ESP32 sends it once per connection.
     String page = R"rawhtml(<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -385,7 +419,8 @@ static esp_err_t index_handler(httpd_req_t *req) {
   #app{display:flex;flex-direction:column;height:100vh}
   #header{display:flex;align-items:center;gap:10px;padding:6px 16px;
     background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0}
-
+  #hinfo {display:flex;align-items:center;gap:10px}
+  #grabbtn {vertical-align:middle}
   #main{
     display:flex;flex:1;min-height:0;
     align-items:center;justify-content:center;
@@ -446,7 +481,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
 
   /* ── grab button ── */
   #grabbtn{
-    margin-top:8px;padding:10px 0;width:376px;border-radius:12px;
+    padding:8px 0;width:240px;border-radius:12px;
     border:1px solid var(--border);background:var(--surface);
     color:var(--text);font-size:15px;cursor:pointer;
     transition:background .1s
@@ -472,17 +507,17 @@ static esp_err_t index_handler(httpd_req_t *req) {
       <span>FPS&nbsp;<b id="hfps">–</b></span>
       <span>RSSI&nbsp;<b id="hrssi">–</b></span>
       <span>Heap&nbsp;<b id="hheap">–</b></span>
-      <button id="grabbtn" onclick="grabFrame()">&#x1F4F7; Save frame</button>
+      <button id="grabbtn" onclick="grabFrame()" disabled>&#x1F4F7; Save Frame</button>
     </div>
     <select id="ressel" onchange="setRes(this.value)">
-      <option value="7">QVGA 320×240</option>
-      <option value="8">HVGA 480×320</option>
-      <option value="9">VGA 640×480</option>
-      <option value="10" selected>SVGA 800×600</option>
-      <option value="11">XGA 1024×768</option>
-      <option value="12">HD 1280×720</option>
-      <option value="13">SXGA 1280×1024</option>
-      <option value="14">UXGA 1600×1200</option>
+      <option value="6">QVGA 320×240</option>
+      <option value="9">HVGA 480×320</option>
+      <option value="10">VGA 640×480</option>
+      <option value="11" selected>SVGA 800×600</option>
+      <option value="12">XGA 1024×768</option>
+      <option value="13">HD 1280×720</option>
+      <option value="14">SXGA 1280×1024</option>
+      <option value="15">UXGA 1600×1200</option>
     </select>
     <button id="lightbtn" onmousedown="toggleLight()">&#9728; Light</button>
   </div>
@@ -528,6 +563,12 @@ static esp_err_t index_handler(httpd_req_t *req) {
 
 </div>
 <script>
+// ── Averaging Configuration ───────────────────────────────────────────────────
+const AVERAGE_N = 5;
+let snapshotQueue = [];
+const tempCanvas = document.createElement('canvas');
+const tempCtx = tempCanvas.getContext('2d');
+
 var ws=null,lightOn=false,lastFrame=0,fps=0,fpsT=0,fpsC=0;
 var cv=document.getElementById('cv'),ctx=cv.getContext('2d');
 var dot=document.getElementById('dot');
@@ -552,16 +593,80 @@ function setRes(val){
     .then(function(r){if(!r.ok)console.warn('setRes failed');});
 }
 
+// ── Frame Queue & Averaging Logic ────────────────────────────────────────────
+function addFrameToQueue(bitmap){
+  snapshotQueue.push(bitmap);
+  if (snapshotQueue.length > AVERAGE_N) {
+    snapshotQueue.shift();
+  }
+  console.log('Queue size:', snapshotQueue.length);
+  updateButtonState();
+}
+
 function grabFrame(){
-  var ts=new Date().toISOString().replace(/[:.]/g,'-').slice(0,-1);
-  cv.toBlob(function(blob){
+  console.log('grabFrame called. Queue size:', snapshotQueue.length);
+  
+  if (snapshotQueue.length < AVERAGE_N) {
+    alert("Need " + AVERAGE_N + " frames. Currently have: " + snapshotQueue.length);
+    return;
+  }
+
+  // ── Match DISPLAY canvas dimensions (already rotated) ────────────────────────
+  const displayWidth = snapshotQueue[0].height;
+  const displayHeight = snapshotQueue[0].width;
+  tempCanvas.width = displayWidth;
+  tempCanvas.height = displayHeight;
+
+  // Initialize sum array
+  const sumData16 = new Uint16Array(tempCanvas.width * tempCanvas.height * 4);
+  
+  console.log('Averaging ' + snapshotQueue.length + ' frames: ' + 
+    displayWidth + 'x' + displayHeight);
+
+  // Process each frame in the queue
+  for (let i = 0; i < snapshotQueue.length; i++) {
+    const frame = snapshotQueue[i];
+    
+    // Clear and draw current frame (with same rotation as display)
+    tempCtx.clearRect(0, 0, tempCanvas.width, tempCanvas.height);
+    tempCtx.translate(tempCanvas.width/2, tempCanvas.height/2);
+    tempCtx.rotate(-Math.PI/2);
+    tempCtx.drawImage(frame, -frame.width/2, -frame.height/2);
+    tempCtx.setTransform(1, 0, 0, 1, 0, 0); // Reset transform
+    
+    // Accumulate pixel data
+    const imageData = tempCtx.getImageData(0, 0, tempCanvas.width, tempCanvas.height);
+    const data = imageData.data;
+    for (let j = 0; j < data.length; j++) {
+      sumData16[j] += data[j];
+    }
+  }
+
+  // Calculate average and convert to Uint8ClampedArray
+  const avgData = new Uint8ClampedArray(sumData16.length);
+  for (let j = 0; j < sumData16.length; j++) {
+    avgData[j] = Math.floor(sumData16[j] / snapshotQueue.length);
+  }
+
+  // Draw averaged result to temp canvas
+  const finalImageData = new ImageData(avgData, tempCanvas.width, tempCanvas.height);
+  tempCtx.putImageData(finalImageData, 0, 0);
+
+  // Download the averaged image (already in correct orientation)
+  tempCanvas.toBlob(function(blob){
     var a=document.createElement('a');
     a.href=URL.createObjectURL(blob);
-    a.download='frame-'+ts+'.jpg';
+    a.download='averaged-frame-'+Date.now()+'.jpg';
     a.click();
     URL.revokeObjectURL(a.href);
-  },'image/jpeg',0.92);
+  },'image/jpeg',0.95);
+
+  // Clear queue for next batch
+  snapshotQueue = [];
+  console.log('Queue cleared');
 }
+
+
 
 function toggleLight(){
   lightOn=!lightOn;
@@ -590,6 +695,8 @@ function connect(){
       ctx.rotate(-Math.PI/2);
       ctx.drawImage(b, -b.width/2, -b.height/2);
       ctx.resetTransform();
+      // Add to queue for averaging
+      addFrameToQueue(b);
     });
   };
 }
@@ -633,6 +740,38 @@ setInterval(function(){
     document.getElementById('sevent').textContent=j.event;
   });
 },1000);
+
+// // ── Initialize Camera Resolution ────────────────────────────────────────────
+// function initCameraResolution() {
+//     fetch('/camera-res')
+//         .then(function(r){return r.json();})
+//         .then(function(data){
+//             const resSelect = document.getElementById('ressel');
+//             const currentRes = data.currentRes;
+//             resSelect.value = currentRes;
+//             console.log('Camera resolution synced:', currentRes);
+//         })
+//         .catch(function(err){
+//             console.warn('Could not sync camera resolution:', err);
+//             // Default to SVGA
+//             document.getElementById('ressel').value = "11";
+//         });
+// }
+
+// // Call on page load
+// initCameraResolution();
+
+
+
+// Update button state when frames are queued
+function updateButtonState(){
+  const btn = document.getElementById('grabbtn');
+  btn.disabled = snapshotQueue.length < AVERAGE_N;
+  console.log('Button state: disabled=' + btn.disabled + ', queue=' + snapshotQueue.length);
+}
+
+// Initial check
+updateButtonState();
 
 connect();
 </script>
